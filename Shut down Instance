@@ -1,0 +1,14 @@
+aws ec2 terminate-instances --instance-ids i-1234567890abcdef0
+
+
+
+The valid values for instance-state-code will all be in the range of the low byte and they are:
+	•	0 : pending
+	•	16 : running
+	•	32 : shutting-down
+	•	48 : terminated
+	•	64 : stopping
+	•	80 : stopped
+
+
+
