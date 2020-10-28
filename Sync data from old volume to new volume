@@ -1,0 +1,6 @@
+BATCH SCRIPT TO SYNC DATA FROM OLD TO NEW VOLUME 
+SSH and Connect to EC2. We copy the volume ID of the old volume then type
+
+mkdir /mnt/oldvolumeid
+
+mount  /dev/xvda /mnt/oldvolumeid
