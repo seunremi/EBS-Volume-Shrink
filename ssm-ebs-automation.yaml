@@ -1,0 +1,393 @@
+description: Downsize EBS volumes to save cost. 
+schemaVersion: '0.3'
+assumeRole: '{{ AutomationAssumeRole }}'
+outputs:
+  - GetVolume.volumeAZ
+  - GetInstance.platform
+  - GetInstanceInfo.platform
+parameters:
+  AutomationAssumeRole:
+    type: String
+    description: '(Required) The ARN of the role that allows Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses your IAM permissions to execute this document.'
+    default: ''
+  VolumeId:
+    type: String
+    description: (Required) The Volume that is being resized
+    default: ''
+  NewVolumeSize:
+    type: Integer
+    description: (Required) The size of the new volume
+    default: 0
+  NewVolumeSizeString:
+    type: String
+    description: (Required) The size of the new volume
+    default: ''
+  Platform:
+    type: String
+    description: "Linux or Windows"
+    default: "Windows"
+mainSteps:
+#Get Info for Original Volume
+- name: GetVolume
+  action: 'aws:executeAwsApi'
+  inputs:
+    Service: ec2
+    Api: DescribeVolumes
+    VolumeIds: ['{{ VolumeId }}']
+  outputs:
+    - Name: volumeAZ
+      Selector: '$.Volumes[0].AvailabilityZone'
+      Type: String
+    - Name: device
+      Selector: '$.Volumes[0].Attachments[0].Device'
+      Type: String
+    - Name: instanceId
+      Selector: '$.Volumes[0].Attachments[0].InstanceId'
+      Type: String
+    - Name: encrypted
+      Selector: '$.Volumes[0].Encrypted'
+      Type: Boolean
+    - Name: kmsKeyId
+      Selector: '$.Volumes[0].KmsKeyId'
+      Type: String
+    - Name: volumeType
+      Selector: '$.Volumes[0].VolumeType'
+      Type: String
+    - Name: tagSet
+      Selector: '$.Volumes[0].Tags'
+      Type: MapList
+    - Name: size
+      Selector: '$.Volumes[0].Size'
+      Type: Integer
+- name: GetInstanceInfo
+  action: aws:executeAwsApi
+  inputs:
+    Service: ec2
+    Api: DescribeInstances
+    InstanceIds:
+    - '{{ GetVolume.instanceId }}'
+  outputs:
+  - Name: subnet
+    Selector: "$.Reservations[0].Instances[0].SubnetId"
+    Type: String
+  - Name: securityGroup
+    Selector: "$.Reservations[0].Instances[0].SecurityGroups[0].GroupId"
+    Type: String
+  - Name: instanceProfileArn
+    Selector: "$.Reservations[0].Instances[0].IamInstanceProfile.Arn"
+    Type: String
+  - Name: platform
+    Selector: "$.Reservations[0].Instances[0].Platform"
+    Type: String
+#Stop the Source Instance
+# The following error will be displayed if the EBS volume is not attached to an instance
+# Step fails when it is validating and resolving the step inputs. Failed to resolve input: InstanceIds to type StringList. 
+# Cannot Find Value for InstanceIds.. Please refer to Automation Service Troubleshooting Guide for more diagnosis details.
+- name: stopInstance
+  action: aws:changeInstanceState
+  maxAttempts: 3
+  timeoutSeconds: 3600
+  onFailure: Abort
+  inputs:
+    InstanceIds:
+      - '{{ GetVolume.instanceId }}'
+    CheckStateOnly: false
+    DesiredState: stopped
+#Create Snapshot of Source Volume
+- name: CreateVolumeSnapshot
+  action: aws:executeAwsApi
+  inputs:
+    Service: ec2
+    Api: CreateSnapshot
+    VolumeId: "{{ VolumeId }}"
+    Description: "Temporary Snapshot for SSM EBS resize {{ VolumeId }}"
+  outputs:
+  - Name: snapshotId
+    Selector: SnapshotId
+    Type: String
+#Wait for snapshot to complete
+- name: verifySnapshot
+  action: aws:waitForAwsResourceProperty
+  inputs:
+    Service: ec2
+    Api: DescribeSnapshots
+    SnapshotIds: ["{{CreateVolumeSnapshot.snapshotId}}"]
+    PropertySelector: Snapshots[0].State
+    DesiredValues:
+    - completed
+#Create tmp Volume from Source Snapshot
+- name: CreateTmpVolume
+  action: 'aws:executeAwsApi'
+  inputs:
+    Service: ec2
+    Api: CreateVolume
+    AvailabilityZone: '{{ GetVolume.volumeAZ }}'
+    Size: '{{ GetVolume.size }}'
+    KmsKeyId: '{{ GetVolume.kmsKeyId }}'
+    Encrypted: '{{ GetVolume.encrypted }}'
+    VolumeType: '{{ GetVolume.volumeType }}'
+    SnapshotId: '{{ CreateVolumeSnapshot.snapshotId }}'
+  outputs:
+    - Name: newVolumeId
+      Selector: '$.VolumeId'
+      Type: String
+#Create new Smaller volume
+- name: CreateSmallVolume
+  action: 'aws:executeAwsApi'
+  inputs:
+    Service: ec2
+    Api: CreateVolume
+    AvailabilityZone: '{{ GetVolume.volumeAZ }}'
+    Size: '{{ NewVolumeSize }}'
+    KmsKeyId: '{{ GetVolume.kmsKeyId }}'
+    Encrypted: '{{ GetVolume.encrypted }}'
+    VolumeType: '{{ GetVolume.volumeType }}'
+  outputs:
+    - Name: newVolumeId
+      Selector: '$.VolumeId'
+      Type: String
+#Wait for both volumes to be available
+- name: WaitVolumes
+  action: aws:waitForAwsResourceProperty
+  timeoutSeconds: 30
+  inputs:
+    Service: ec2
+    Api: DescribeVolumes
+    VolumeIds:
+    - '{{ CreateSmallVolume.newVolumeId }}'
+    - '{{ CreateTmpVolume.newVolumeId }}'
+    PropertySelector: '$.Volumes[0].State'
+    DesiredValues:
+    - 'available'
+#Tag both volumes with the same tags as the source volume
+- name: TagVolumes
+  action: aws:createTags
+  maxAttempts: 3
+  onFailure: Abort
+  inputs:
+    ResourceType: EC2
+    ResourceIds:
+    - '{{ CreateSmallVolume.newVolumeId }}'
+    - '{{ CreateTmpVolume.newVolumeId }}'
+    Tags: '{{ GetVolume.tagSet }}'
+#Launch Worker Instance
+#TODO: remove hard codes for instance parameters
+- name: launchWorkerInstance
+  action: aws:runInstances
+  maxAttempts: 3
+  timeoutSeconds: 1200
+  onFailure: Abort
+  inputs:
+    ImageId: ami-0dba2cb6798deb6d8
+    InstanceType: t3.small
+    MinInstanceCount: 1
+    MaxInstanceCount: 1
+    IamInstanceProfileArn: "{{ GetInstanceInfo.instanceProfileArn }}"
+    SubnetId: "{{ GetInstanceInfo.subnet }}"
+    SecurityGroupIds: 
+    - "{{ GetInstanceInfo.securityGroup }}"
+    TagSpecifications:
+    - ResourceType: instance
+      Tags:
+      - Key: LaunchedBy
+        Value: SSMAutomation
+      - Key: Name
+        Value: SSMworkerForEBSresize
+  outputs:
+    - Name: instanceId
+      Selector: '$.InstanceIds[0]'
+      Type: String
+#Attach Volumes to Worker Instance
+- name: attachTmpVolume
+  action: 'aws:executeAwsApi'
+  timeoutSeconds: 60
+  onFailure: Abort
+  inputs:
+    Service: ec2
+    Api: AttachVolume
+    VolumeId: '{{ CreateTmpVolume.newVolumeId }}'
+    InstanceId: '{{ launchWorkerInstance.instanceId }}'
+    Device: /dev/xvdy
+  outputs:
+    - Name: EbsState
+      Selector: $.State
+      Type: String
+- name: attachSmallVolume
+  action: 'aws:executeAwsApi'
+  timeoutSeconds: 60
+  onFailure: Abort
+  inputs:
+    Service: ec2
+    Api: AttachVolume
+    VolumeId: '{{ CreateSmallVolume.newVolumeId }}'
+    InstanceId: '{{ launchWorkerInstance.instanceId }}'
+    Device: /dev/xvdz
+  outputs:
+    - Name: EbsState
+      Selector: $.State
+      Type: String
+# Run OS level tasks with Runcommand
+- name: GetInstance
+  action: aws:executeAwsApi
+  inputs:
+    Service: ssm
+    Api: DescribeInstanceInformation
+    Filters:
+    - Key: InstanceIds
+      Values: ['{{ GetVolume.instanceId }}']
+  outputs:
+  - Name: myInstance
+    Selector: '$.InstanceInformationList[0].InstanceId'
+    Type: String
+  - Name: platform
+    Selector: '$.InstanceInformationList[0].PlatformType'
+    Type: String
+- name: chooseOS
+  action: aws:branch
+  inputs:
+    Choices:
+    - NextStep: windowsSyncVolume
+      Variable: "{{ Platform }}"
+      StringEquals: "Windows"
+    - NextStep: linuxSyncVolume
+      Variable: "{{ Platform }}"
+      StringEquals: "Linux"
+    Default:
+      sleep3
+- name: windowsSyncVolume
+  action: 'aws:runCommand'
+  timeoutSeconds: 28800
+  inputs:
+    DocumentName: AWS-RunShellScript
+    InstanceIds:
+      - '{{ launchWorkerInstance.instanceId }}'
+    Parameters:
+      commands:
+        - "#!/bin/bash"
+        - "sfdisk -d /dev/nvme1n1"
+        - "if [ -e /dev/nvme1n1p2 ]; then"
+        - "ntfsresize -f -s {{ NewVolumeSizeString }}G /dev/nvme1n1p2"
+        - "else"
+        - "ntfsresize -f -s {{ NewVolumeSizeString }}G /dev/nvme1n1p1"
+        - "fi"
+        - "dd bs=1M if=/dev/nvme1n1 of=/dev/nvme2n1 || true"
+      executionTimeout: "28800"
+  nextStep: detachVolumeTmp  
+- name: linuxSyncVolume
+  action: 'aws:runCommand'
+  timeoutSeconds: 28800
+  inputs:
+    DocumentName: AWS-RunShellScript
+    InstanceIds:
+      - '{{ launchWorkerInstance.instanceId }}'
+    Parameters:
+      commands:
+        - "#!/bin/bash"
+        - "sfdisk -d /dev/nvme1n1"
+        - "if [ -e /dev/nvme1n1p1 ]; then"
+        - "resize2fs -f /dev/nvme1n1p1 {{ NewVolumeSizeString }}G"
+        - "else"
+        - "resize2fs -f /dev/nvme1n1 {{ NewVolumeSizeString }}G"
+        - "fi"
+        - "dd bs=1M if=/dev/nvme1n1 of=/dev/nvme2n1 || true"
+      executionTimeout: "28800"
+  nextStep: detachVolumeTmp  
+#Detach Volumes from Worker instance
+#Detach Tmp Volume
+- name: detachVolumeTmp
+  action: aws:executeAwsApi
+  timeoutSeconds: 60
+  onFailure: Abort
+  inputs:
+    Service: ec2
+    Api: DetachVolume
+    VolumeId: '{{ CreateTmpVolume.newVolumeId }}'
+    InstanceId: '{{ launchWorkerInstance.instanceId }}'
+  outputs:
+    - Name: EbsState
+      Selector: '$.State'
+      Type: String
+#Detach Small Volume
+- name: detachVolumeSmall
+  action: aws:executeAwsApi
+  timeoutSeconds: 60
+  onFailure: Abort
+  inputs:
+    Service: ec2
+    Api: DetachVolume
+    VolumeId: '{{ CreateSmallVolume.newVolumeId }}'
+    InstanceId: '{{ launchWorkerInstance.instanceId }}'
+  outputs:
+    - Name: EbsState
+      Selector: '$.State'
+      Type: String
+#Detach Source Volume
+- name: detachSourceVolume
+  action: aws:executeAwsApi
+  timeoutSeconds: 60
+  onFailure: Abort
+  inputs:
+    Service: ec2
+    Api: DetachVolume
+    VolumeId: '{{ VolumeId }}'
+    InstanceId: '{{ GetVolume.instanceId }}'
+  outputs:
+    - Name: EbsState
+      Selector: '$.State'
+      Type: String
+#Verify volume is available
+- name: WaitVolumeNew
+  action: aws:waitForAwsResourceProperty
+  timeoutSeconds: 30
+  inputs:
+    Service: ec2
+    Api: DescribeVolumes
+    VolumeIds:
+    - '{{ CreateSmallVolume.newVolumeId }}'
+    PropertySelector: '$.Volumes[0].State'
+    DesiredValues:
+    - 'available'
+#Attach Small volume to target instance
+- name: attachVolumeFinal
+  action: 'aws:executeAwsApi'
+  timeoutSeconds: 60
+  onFailure: Abort
+  inputs:
+    Service: ec2
+    Api: AttachVolume
+    VolumeId: '{{ CreateSmallVolume.newVolumeId }}'
+    InstanceId: '{{ GetVolume.instanceId }}'
+    Device: '{{ GetVolume.device }}'
+  outputs:
+    - Name: EbsState
+      Selector: $.State
+      Type: String
+#Start Instance
+- name: startInstance
+  action: aws:changeInstanceState
+  maxAttempts: 3
+  timeoutSeconds: 3600
+  onFailure: Abort
+  inputs:
+    InstanceIds:
+      - '{{ GetVolume.instanceId }}'
+    CheckStateOnly: false
+    DesiredState: running
+#Terminate Worker instance
+- name: terminateWorkerInstance
+  action: aws:changeInstanceState
+  maxAttempts: 3
+  timeoutSeconds: 3600
+  onFailure: Abort
+  inputs:
+    InstanceIds:
+      - '{{ launchWorkerInstance.instanceId }}'
+    CheckStateOnly: false
+    DesiredState: terminated
+    Force: true
+#TODO:  Delete tmp Volume
+#       Delete tmp snapshot  
+- name: sleep3
+  action: aws:sleep
+  inputs:
+    Duration: PT3S
